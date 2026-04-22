@@ -6,6 +6,10 @@ REQUEST_TIMEOUT="8s"
 USE_INSECURE="false"
 KEEP_WORKDIR="false"
 MAX_TOKENS=300
+SCAN_MAX_DEPTH=12
+MAX_SOURCE_FILES_PER_DIR=8000
+FIND_TIMEOUT="45s"
+CHECK_PROFILE="quick"
 
 declare -a SCAN_DIRS=(
   "/var/lib/kubelet/pods"
@@ -31,6 +35,10 @@ Options:
   --kubeconfig-file <path>     Add explicit kubeconfig file to extract tokens from (can be repeated)
   --request-timeout <duration> kubectl request timeout (default: 8s)
   --max-tokens <number>        Safety limit for number of distinct tokens to evaluate (default: 300)
+  --scan-max-depth <number>    Max directory depth for file scanning (default: 12)
+  --max-source-files <number>  Max discovered files per scan-dir before truncation (default: 8000)
+  --find-timeout <duration>    Timeout per find command, e.g., 45s, 2m (default: 45s)
+  --thorough                   Run full permission check set (slower)
   --insecure-skip-tls-verify   Use insecure TLS for generated kubeconfigs
   --keep-workdir               Keep temporary output directory
   -h, --help                   Show this help
@@ -39,6 +47,7 @@ Examples:
   bash token-permission-audit.sh
   bash token-permission-audit.sh --scan-dir /host-system/var/lib/kubelet/pods
   bash token-permission-audit.sh --token-file /tmp/token
+  bash token-permission-audit.sh --thorough --request-timeout 5s
 EOF
 }
 
@@ -68,6 +77,22 @@ while [[ $# -gt 0 ]]; do
       MAX_TOKENS="$2"
       shift 2
       ;;
+    --scan-max-depth)
+      SCAN_MAX_DEPTH="$2"
+      shift 2
+      ;;
+    --max-source-files)
+      MAX_SOURCE_FILES_PER_DIR="$2"
+      shift 2
+      ;;
+    --find-timeout)
+      FIND_TIMEOUT="$2"
+      shift 2
+      ;;
+    --thorough)
+      CHECK_PROFILE="thorough"
+      shift
+      ;;
     --insecure-skip-tls-verify)
       USE_INSECURE="true"
       shift
@@ -95,6 +120,16 @@ fi
 
 if ! [[ "$MAX_TOKENS" =~ ^[0-9]+$ ]]; then
   echo "[!] --max-tokens must be a number." >&2
+  exit 1
+fi
+
+if ! [[ "$SCAN_MAX_DEPTH" =~ ^[0-9]+$ ]]; then
+  echo "[!] --scan-max-depth must be a number." >&2
+  exit 1
+fi
+
+if ! [[ "$MAX_SOURCE_FILES_PER_DIR" =~ ^[0-9]+$ ]]; then
+  echo "[!] --max-source-files must be a number." >&2
   exit 1
 fi
 
@@ -153,18 +188,50 @@ add_source_file() {
   fi
 }
 
+run_find() {
+  local dir="$1"
+  shift
+
+  if command -v timeout >/dev/null 2>&1; then
+    timeout "$FIND_TIMEOUT" find "$dir" "$@" 2>/dev/null || true
+  else
+    find "$dir" "$@" 2>/dev/null || true
+  fi
+}
+
+echo "[i] Starting source discovery..."
+
 for dir in "${SCAN_DIRS[@]}"; do
   if [[ -d "$dir" ]]; then
+    echo "[i] Scanning dir: $dir"
     before_tokens="${#TOKEN_FILES[@]}"
     before_kubeconfigs="${#KUBECONFIG_FILES[@]}"
 
-    while IFS= read -r file; do
-      add_source_file "$file" "token"
-    done < <(find "$dir" -type f \( -name token -o -name '*.token' \) 2>/dev/null)
+    if [[ "$dir" == *"/var/lib/kubelet/pods"* ]]; then
+      while IFS= read -r file; do
+        add_source_file "$file" "token"
+      done < <(run_find "$dir" -maxdepth "$SCAN_MAX_DEPTH" -type f \( -path '*/volumes/kubernetes.io~projected/*/token' -o -path '*/volumes/kubernetes.io~secret/*/token' -o -name token -o -name '*.token' \) | head -n "$MAX_SOURCE_FILES_PER_DIR")
 
-    while IFS= read -r file; do
-      add_source_file "$file" "kubeconfig"
-    done < <(find "$dir" -type f \( -name kubeconfig -o -name '*.kubeconfig' \) 2>/dev/null)
+      while IFS= read -r file; do
+        add_source_file "$file" "kubeconfig"
+      done < <(run_find "$dir" -maxdepth "$SCAN_MAX_DEPTH" -type f \( -name kubeconfig -o -name '*.kubeconfig' \) | head -n "$MAX_SOURCE_FILES_PER_DIR")
+    elif [[ "$dir" == *"/var/run/secrets"* ]]; then
+      while IFS= read -r file; do
+        add_source_file "$file" "token"
+      done < <(run_find "$dir" -maxdepth "$SCAN_MAX_DEPTH" -type f \( -path '*/kubernetes.io/serviceaccount/token' -o -name token -o -name '*.token' \) | head -n "$MAX_SOURCE_FILES_PER_DIR")
+
+      while IFS= read -r file; do
+        add_source_file "$file" "kubeconfig"
+      done < <(run_find "$dir" -maxdepth "$SCAN_MAX_DEPTH" -type f \( -name kubeconfig -o -name '*.kubeconfig' \) | head -n "$MAX_SOURCE_FILES_PER_DIR")
+    else
+      while IFS= read -r file; do
+        add_source_file "$file" "token"
+      done < <(run_find "$dir" -maxdepth "$SCAN_MAX_DEPTH" -type f \( -name token -o -name '*.token' \) | head -n "$MAX_SOURCE_FILES_PER_DIR")
+
+      while IFS= read -r file; do
+        add_source_file "$file" "kubeconfig"
+      done < <(run_find "$dir" -maxdepth "$SCAN_MAX_DEPTH" -type f \( -name kubeconfig -o -name '*.kubeconfig' \) | head -n "$MAX_SOURCE_FILES_PER_DIR")
+    fi
 
     found_tokens=$(( ${#TOKEN_FILES[@]} - before_tokens ))
     found_kubeconfigs=$(( ${#KUBECONFIG_FILES[@]} - before_kubeconfigs ))
@@ -268,7 +335,20 @@ make_kubeconfig_for_token() {
   } > "$out"
 }
 
-declare -a CHECKS=(
+declare -a CHECKS_QUICK=(
+  "50::create clusterrolebindings.rbac.authorization.k8s.io::create-clusterrolebindings"
+  "45::escalate clusterroles.rbac.authorization.k8s.io::escalate-clusterroles"
+  "45::bind clusterroles.rbac.authorization.k8s.io::bind-clusterroles"
+  "40::approve certificatesigningrequests.certificates.k8s.io::approve-csrs"
+  "35::impersonate users::impersonate-users"
+  "30::--all-namespaces create daemonsets.apps::create-daemonsets-all-ns"
+  "25::--all-namespaces create pods::create-pods-all-ns"
+  "25::patch nodes::patch-nodes"
+  "25::use securitycontextconstraints.security.openshift.io privileged::use-scc-privileged"
+  "15::--all-namespaces list secrets::list-secrets-all-ns"
+)
+
+declare -a CHECKS_THOROUGH=(
   "50::create clusterrolebindings.rbac.authorization.k8s.io::create-clusterrolebindings"
   "45::escalate clusterroles.rbac.authorization.k8s.io::escalate-clusterroles"
   "45::bind clusterroles.rbac.authorization.k8s.io::bind-clusterroles"
@@ -290,11 +370,19 @@ declare -a CHECKS=(
   "10::list nodes::list-nodes"
 )
 
+declare -a CHECKS=()
+if [[ "$CHECK_PROFILE" == "thorough" ]]; then
+  CHECKS=("${CHECKS_THOROUGH[@]}")
+else
+  CHECKS=("${CHECKS_QUICK[@]}")
+fi
+
 RESULTS_TSV="$WORKDIR/results.tsv"
 echo -e "score\tidentity\ttoken_id\tsource\thits" > "$RESULTS_TSV"
 
 echo "[i] Distinct tokens found: ${#TOKENS[@]}"
 echo "[i] Evaluating token permissions against: $SERVER"
+echo "[i] Permission check profile: $CHECK_PROFILE (${#CHECKS[@]} checks per token)"
 
 limit="${#TOKENS[@]}"
 if [[ "$limit" -gt "$MAX_TOKENS" ]]; then
@@ -308,6 +396,8 @@ for ((i=0; i<limit; i++)); do
 
   cfg="$WORKDIR/kubeconfig-$i.yaml"
   make_kubeconfig_for_token "$token" "$cfg"
+
+  echo "[i] Auditing token $((i+1))/$limit (token_id=$token_id)"
 
   whoami="$(kubectl --kubeconfig "$cfg" --request-timeout="$REQUEST_TIMEOUT" auth whoami 2>/dev/null || true)"
   if [[ -z "$whoami" ]]; then
